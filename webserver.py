@@ -1,11 +1,93 @@
+import os
+import time
+import logging
+import threading
+
+import serial
+import serial.tools.list_ports
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-import httpx
+
+# --- Configure Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(message)s'
+)
 
 app = FastAPI(title="Send a Message")
 
-# The Flask server.py endpoint
-FLASK_API_URL = "http://127.0.0.1:8080/v1/display"
+ARDUINO_PORT = os.getenv('ARDUINO_PORT', '').strip()
+BAUD_RATE = int(os.getenv('ARDUINO_BAUD', '9600'))
+APP_HOST = os.getenv('APP_HOST', '0.0.0.0')
+APP_PORT = int(os.getenv('APP_PORT', '3000'))
+MAX_LINE_LENGTH = int(os.getenv('MAX_LINE_LENGTH', '16'))
+CONNECT_DELAY_SECONDS = int(os.getenv('CONNECT_DELAY_SECONDS', '2'))
+
+arduino = None
+arduino_lock = threading.Lock()
+
+
+def find_arduino_port():
+    if ARDUINO_PORT:
+        logging.info(f"Using configured Arduino port: {ARDUINO_PORT}")
+        return ARDUINO_PORT
+
+    ports = list(serial.tools.list_ports.comports())
+    candidates = []
+    for port in ports:
+        desc = (port.description or '').lower()
+        hwid = (port.hwid or '').lower()
+        device = port.device
+
+        if 'arduino' in desc or 'arduino' in hwid:
+            candidates.append(device)
+        elif 'usb serial' in desc or 'usb serial' in hwid:
+            candidates.append(device)
+        elif device.lower().startswith('com') or device.lower().startswith('/dev/tty'):
+            candidates.append(device)
+
+    if len(candidates) == 1:
+        logging.info(f"Auto-detected Arduino port: {candidates[0]}")
+        return candidates[0]
+    if candidates:
+        logging.warning(f"Multiple serial port candidates found: {candidates}. Using {candidates[0]}.")
+        return candidates[0]
+
+    logging.error('No serial ports found for Arduino.')
+    return None
+
+
+def connect_arduino():
+    global arduino
+    port = find_arduino_port()
+    if not port:
+        return None
+
+    try:
+        arduino = serial.Serial(port, BAUD_RATE, timeout=1)
+        time.sleep(CONNECT_DELAY_SECONDS)
+        logging.info(f"Successfully connected to Arduino on {port}")
+        return arduino
+    except Exception as e:
+        logging.error(f"Failed to connect to Arduino on {port}: {e}")
+        arduino = None
+        return None
+
+
+def ensure_connection():
+    global arduino
+    if arduino and arduino.is_open:
+        return True
+    return connect_arduino() is not None
+
+
+def send_payload(payload: str):
+    if not ensure_connection():
+        raise RuntimeError('Arduino is not connected.')
+
+    with arduino_lock:
+        arduino.write(payload.encode('utf-8'))
+
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -587,6 +669,13 @@ async def send_message(request: Request):
         )
 
     try:
+        # Enforce the same line length constraints server-side as well.
+        if len(line1) > 16 or len(line2) > 16:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Each line must be 16 characters or fewer."}
+            )
+
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 FLASK_API_URL,
