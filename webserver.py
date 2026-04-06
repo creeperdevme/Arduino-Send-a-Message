@@ -655,12 +655,23 @@ async def index():
     return HTML_PAGE
 
 
+def sanitize_line(text: str) -> str:
+    filtered = ''.join(ch for ch in text if 0x20 <= ord(ch) <= 0x7E)
+    return filtered[:MAX_LINE_LENGTH]
+
+
+@app.get("/health")
+def health():
+    if ensure_connection():
+        return JSONResponse(status_code=200, content={"status": "ok"})
+    return JSONResponse(status_code=503, content={"status": "arduino_not_connected"})
+
+
 @app.post("/api/send")
 async def send_message(request: Request):
-    """Proxy the message to the Flask server.py running on port 8080."""
     data = await request.json()
-    line1 = data.get("line1", "")
-    line2 = data.get("line2", "")
+    line1 = sanitize_line(data.get("line1", ""))
+    line2 = sanitize_line(data.get("line2", ""))
 
     if not line1 and not line2:
         return JSONResponse(
@@ -668,27 +679,17 @@ async def send_message(request: Request):
             content={"detail": "Please provide at least one line of text."}
         )
 
+    payload = f"{line1}|{line2}\n"
     try:
-        # Enforce the same line length constraints server-side as well.
-        if len(line1) > 16 or len(line2) > 16:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Each line must be 16 characters or fewer."}
-            )
-
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                FLASK_API_URL,
-                json={"line1": line1, "line2": line2}
-            )
-            return JSONResponse(
-                status_code=resp.status_code,
-                content={"message": resp.text}
-            )
-    except httpx.ConnectError:
+        send_payload(payload)
+        return JSONResponse(
+            status_code=200,
+            content={"message": "Message sent successfully."}
+        )
+    except RuntimeError as e:
         return JSONResponse(
             status_code=503,
-            content={"detail": "Cannot connect to display server. Is server.py running?"}
+            content={"detail": str(e)}
         )
     except Exception as e:
         return JSONResponse(
@@ -699,4 +700,5 @@ async def send_message(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3000)
+    logging.info(f"Starting Web Server on {APP_HOST}:{APP_PORT}...")
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)
