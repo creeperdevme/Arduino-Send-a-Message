@@ -1,11 +1,93 @@
+import os
+import time
+import logging
+import threading
+
+import serial
+import serial.tools.list_ports
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-import httpx
+
+# --- Configure Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(message)s'
+)
 
 app = FastAPI(title="Send a Message")
 
-# The Flask server.py endpoint
-FLASK_API_URL = "http://127.0.0.1:8080/v1/display"
+ARDUINO_PORT = os.getenv('ARDUINO_PORT', '').strip()
+BAUD_RATE = int(os.getenv('ARDUINO_BAUD', '9600'))
+APP_HOST = os.getenv('APP_HOST', '0.0.0.0')
+APP_PORT = int(os.getenv('APP_PORT', '3000'))
+MAX_LINE_LENGTH = int(os.getenv('MAX_LINE_LENGTH', '16'))
+CONNECT_DELAY_SECONDS = int(os.getenv('CONNECT_DELAY_SECONDS', '2'))
+
+arduino = None
+arduino_lock = threading.Lock()
+
+
+def find_arduino_port():
+    if ARDUINO_PORT:
+        logging.info(f"Using configured Arduino port: {ARDUINO_PORT}")
+        return ARDUINO_PORT
+
+    ports = list(serial.tools.list_ports.comports())
+    candidates = []
+    for port in ports:
+        desc = (port.description or '').lower()
+        hwid = (port.hwid or '').lower()
+        device = port.device
+
+        if 'arduino' in desc or 'arduino' in hwid:
+            candidates.append(device)
+        elif 'usb serial' in desc or 'usb serial' in hwid:
+            candidates.append(device)
+        elif device.lower().startswith('com') or device.lower().startswith('/dev/tty'):
+            candidates.append(device)
+
+    if len(candidates) == 1:
+        logging.info(f"Auto-detected Arduino port: {candidates[0]}")
+        return candidates[0]
+    if candidates:
+        logging.warning(f"Multiple serial port candidates found: {candidates}. Using {candidates[0]}.")
+        return candidates[0]
+
+    logging.error('No serial ports found for Arduino.')
+    return None
+
+
+def connect_arduino():
+    global arduino
+    port = find_arduino_port()
+    if not port:
+        return None
+
+    try:
+        arduino = serial.Serial(port, BAUD_RATE, timeout=1)
+        time.sleep(CONNECT_DELAY_SECONDS)
+        logging.info(f"Successfully connected to Arduino on {port}")
+        return arduino
+    except Exception as e:
+        logging.error(f"Failed to connect to Arduino on {port}: {e}")
+        arduino = None
+        return None
+
+
+def ensure_connection():
+    global arduino
+    if arduino and arduino.is_open:
+        return True
+    return connect_arduino() is not None
+
+
+def send_payload(payload: str):
+    if not ensure_connection():
+        raise RuntimeError('Arduino is not connected.')
+
+    with arduino_lock:
+        arduino.write(payload.encode('utf-8'))
+
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -573,12 +655,23 @@ async def index():
     return HTML_PAGE
 
 
+def sanitize_line(text: str) -> str:
+    filtered = ''.join(ch for ch in text if 0x20 <= ord(ch) <= 0x7E)
+    return filtered[:MAX_LINE_LENGTH]
+
+
+@app.get("/health")
+def health():
+    if ensure_connection():
+        return JSONResponse(status_code=200, content={"status": "ok"})
+    return JSONResponse(status_code=503, content={"status": "arduino_not_connected"})
+
+
 @app.post("/api/send")
 async def send_message(request: Request):
-    """Proxy the message to the Flask server.py running on port 8080."""
     data = await request.json()
-    line1 = data.get("line1", "")
-    line2 = data.get("line2", "")
+    line1 = sanitize_line(data.get("line1", ""))
+    line2 = sanitize_line(data.get("line2", ""))
 
     if not line1 and not line2:
         return JSONResponse(
@@ -586,20 +679,17 @@ async def send_message(request: Request):
             content={"detail": "Please provide at least one line of text."}
         )
 
+    payload = f"{line1}|{line2}\n"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                FLASK_API_URL,
-                json={"line1": line1, "line2": line2}
-            )
-            return JSONResponse(
-                status_code=resp.status_code,
-                content={"message": resp.text}
-            )
-    except httpx.ConnectError:
+        send_payload(payload)
+        return JSONResponse(
+            status_code=200,
+            content={"message": "Message sent successfully."}
+        )
+    except RuntimeError as e:
         return JSONResponse(
             status_code=503,
-            content={"detail": "Cannot connect to display server. Is server.py running?"}
+            content={"detail": str(e)}
         )
     except Exception as e:
         return JSONResponse(
@@ -610,4 +700,5 @@ async def send_message(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3000)
+    logging.info(f"Starting Web Server on {APP_HOST}:{APP_PORT}...")
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)
