@@ -1,5 +1,7 @@
 # Arduino-Send-a-Message
 
+**English** | [繁體中文](README.zh-TW.md)
+
 Type a message in your browser, and it shows up on a 16×2 LCD wired to an Arduino — with a short double beep to announce it.
 
 The Arduino listens on the serial port. A small Python web server runs on your PC, serves a web form, and forwards whatever you type down the USB cable.
@@ -183,7 +185,8 @@ Arduino-Send-a-Message/
 ├── server.py         # Minimal Flask server
 ├── requirements.txt  # Python dependencies
 ├── .env.example      # Configuration template
-└── README.md
+├── README.md         # This file (English)
+└── README.zh-TW.md   # 繁體中文版
 ```
 
 ---
